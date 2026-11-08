@@ -9,7 +9,7 @@
 // is disabled.
 //
 // HTTP API on 127.0.0.1:<port> (default 37322) for the Stream Deck plugin:
-//   GET  /health                     { ok, name, version, renderer }
+//   GET  /health                     { ok, name, version, renderer, clipboard: route used }
 //   GET  /status                     { name, version, me, fileLimit, textLimit }
 //   GET  /peek?content=<mode>        what is on the clipboard right now (nothing kept)
 //   POST /prepare { content }        freeze the clipboard: { snapshot: { id, kind, … } }
@@ -33,14 +33,17 @@
 // the Host header must be 127.0.0.1 / localhost (stops DNS rebinding).
 
 import { execFile } from "child_process";
-import { BrowserWindow, clipboard, type IpcMainInvokeEvent, type WebContents } from "electron";
+import { randomBytes } from "crypto";
+import type { IpcMainInvokeEvent, WebContents } from "electron";
+import * as electron from "electron";
 import { promises as fs } from "fs";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "http";
-import { basename, extname } from "path";
+import { tmpdir } from "os";
+import { basename, extname, join } from "path";
 import { fileURLToPath } from "url";
 
 const NAME = "ClipboardSendDeck";
-const VERSION = "1.0.0";
+const VERSION = "1.0.1";
 const DEFAULT_PORT = 37322;
 const MAX_BODY = 256 * 1024;
 const MAX_FILES = 30;
@@ -93,49 +96,245 @@ const MIME: Record<string, string> = {
 };
 const mimeOf = (name: string) => MIME[extname(name).toLowerCase()] ?? "application/octet-stream";
 
-function run(cmd: string, args: string[], timeout = 5000): Promise<string> {
+function run(cmd: string, args: string[], timeout = 8000): Promise<string> {
     return new Promise((resolve, reject) => {
-        execFile(cmd, args, { timeout, windowsHide: true, maxBuffer: 4 * 1024 * 1024, encoding: "utf8" }, (err, stdout) => {
-            if (err) reject(err);
+        execFile(cmd, args, { timeout, windowsHide: true, maxBuffer: 16 * 1024 * 1024, encoding: "utf8" }, (err, stdout, stderr) => {
+            if (err) reject(Object.assign(err, { stderr: String(stderr ?? "") }));
             else resolve(String(stdout));
         });
     });
 }
 
-/** Paths of files copied in Explorer / Finder / a file manager, in clipboard order. */
-async function clipboardFiles(): Promise<string[]> {
+// ── reading the clipboard ───────────────────────────────────────────────────
+//
+// Three routes, first one that works wins:
+//   1. Electron's clipboard module
+//   2. Electron's built-in clipboard binding (what the module wraps). Vencord replaces the
+//      "electron" exports in Discord's main process, and on some Discord builds the clipboard
+//      that comes through has no readImage / readText, so the module alone isn't enough.
+//   3. The OS itself: one PowerShell call on Windows (files, image or text in one go),
+//      osascript / JXA on macOS, wl-paste / xclip on Linux.
+
+interface RawClipboard { files: string[]; png: Buffer | null; text: string; }
+
+interface ElectronClipboard {
+    readText(): string;
+    readImage(): { isEmpty(): boolean; toPNG(): Buffer; };
+    readBuffer?(format: string): Buffer;
+    read?(format: string): string;
+}
+
+const isFn = (o: any, k: string) => !!o && typeof o[k] === "function";
+const usable = (c: any): c is ElectronClipboard => isFn(c, "readText") && isFn(c, "readImage");
+
+export type ClipboardRoute = "electron" | "binding" | "system";
+let clipRoute: ClipboardRoute | null = null;
+let api: ElectronClipboard | null = null;
+let routeNote = "";
+
+function pickRoute(): ClipboardRoute {
+    if (clipRoute) return clipRoute;
+    const candidates: [ClipboardRoute, () => any][] = [
+        ["electron", () => (electron as any).clipboard],
+        ["electron", () => (electron as any).default?.clipboard],
+        ["binding", () => (process as any)._linkedBinding?.("electron_common_clipboard")]
+    ];
+    const seen: string[] = [];
+    for (const [name, get] of candidates) {
+        let c: any;
+        try { c = get(); } catch { continue; }
+        if (c) {
+            const proto = Object.getPrototypeOf(c);
+            const keys = Object.keys(c).concat(proto && proto !== Object.prototype ? Object.getOwnPropertyNames(proto) : []);
+            seen.push(`${name}: ${keys.filter(k => k !== "constructor" && typeof c[k] === "function").slice(0, 20).join(",") || "no methods"}`);
+        }
+        if (usable(c)) {
+            api = c;
+            clipRoute = name;
+            routeNote = seen.join(" | ");
+            log(`Clipboard via ${name}`);
+            return clipRoute;
+        }
+    }
+    clipRoute = "system";
+    routeNote = seen.join(" | ") || "no Electron clipboard found";
+    log(`Electron clipboard unusable (${routeNote}), reading the clipboard through the OS`);
+    return clipRoute;
+}
+
+const fromFileUrls = (lines: string) => lines.split(/\r?\n/).map(l => l.trim()).filter(l => l.startsWith("file://")).map(l => fileURLToPath(l));
+
+/** A temp file name for an image the OS writes for us (removed right after reading). */
+const tempPng = () => join(tmpdir(), `csd-${process.pid}-${randomBytes(6).toString("hex")}.png`);
+
+async function takeFile(path: string): Promise<Buffer | null> {
     try {
-        if (process.platform === "win32") {
-            // Electron only exposes the FIRST copied file ("FileNameW"); it tells us cheaply
-            // whether files are there at all, then PowerShell lists every one of them.
-            const first = clipboard.readBuffer("FileNameW").toString("utf16le").replace(/\0[\s\S]*$/, "");
-            if (!first) return [];
-            try {
-                const out = await run("powershell.exe", [
-                    "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command",
-                    "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; Get-Clipboard -Format FileDropList | ForEach-Object { $_.FullName }"
-                ]);
-                const all = out.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
-                return all.length ? all : [first];
-            } catch (e) {
-                log("PowerShell file list failed, using the first file only:", e);
-                return [first];
+        return await fs.readFile(path);
+    } catch {
+        return null;
+    } finally {
+        fs.unlink(path).catch(() => { });
+    }
+}
+
+/** Windows: one PowerShell (STA) run answers files → image → text, as JSON. */
+function windowsScript(mode: ContentMode, png: string): string {
+    const q = (v: string) => `'${v.replace(/'/g, "''")}'`;
+    return `
+$ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+$mode = ${q(mode)}
+$out = @{ files = @(); image = $false; text = $null }
+if ($mode -ne 'text') {
+    $list = [System.Windows.Forms.Clipboard]::GetFileDropList()
+    if ($list -and $list.Count -gt 0) { $out.files = @($list | ForEach-Object { [string]$_ }) }
+    else {
+        $data = [System.Windows.Forms.Clipboard]::GetDataObject()
+        if ($data -and $data.GetDataPresent('PNG')) {
+            $ms = $data.GetData('PNG')
+            if ($ms -is [System.IO.MemoryStream]) { [System.IO.File]::WriteAllBytes(${q(png)}, $ms.ToArray()); $out.image = $true }
+        }
+        if (-not $out.image -and [System.Windows.Forms.Clipboard]::ContainsImage()) {
+            $img = [System.Windows.Forms.Clipboard]::GetImage()
+            if ($img) { $img.Save(${q(png)}, [System.Drawing.Imaging.ImageFormat]::Png); $img.Dispose(); $out.image = $true }
+        }
+    }
+}
+if ($mode -ne 'media' -and $out.files.Count -eq 0 -and -not $out.image -and [System.Windows.Forms.Clipboard]::ContainsText()) {
+    $out.text = [System.Windows.Forms.Clipboard]::GetText()
+}
+ConvertTo-Json -InputObject $out -Compress -Depth 3
+`;
+}
+
+/** macOS: JXA (osascript -l JavaScript) reads every copied file, a PNG/TIFF image or text. */
+function macScript(mode: ContentMode, png: string): string {
+    return `
+ObjC.import("AppKit");
+const mode = ${JSON.stringify(mode)};
+const pb = $.NSPasteboard.generalPasteboard;
+const out = { files: [], image: false, text: null };
+if (mode !== "text") {
+    const opts = $.NSDictionary.dictionaryWithObjectForKey($.NSNumber.numberWithBool(true), $.NSPasteboardURLReadingFileURLsOnlyKey);
+    const urls = pb.readObjectsForClassesOptions($.NSArray.arrayWithObject($.NSURL), opts);
+    if (urls && !urls.isNil()) for (let i = 0; i < urls.count; i++) out.files.push(urls.objectAtIndex(i).path.js);
+    if (!out.files.length) {
+        let data = pb.dataForType($.NSPasteboardTypePNG);
+        if (!data || data.isNil()) {
+            const tiff = pb.dataForType($.NSPasteboardTypeTIFF);
+            if (tiff && !tiff.isNil()) data = $.NSBitmapImageRep.imageRepWithData(tiff).representationUsingTypeProperties($.NSBitmapImageFileTypePNG, $.NSDictionary.dictionary);
+        }
+        if (data && !data.isNil()) out.image = data.writeToFileAtomically(${JSON.stringify(png)}, true);
+    }
+}
+if (mode !== "media" && !out.files.length && !out.image) {
+    const t = pb.stringForType($.NSPasteboardTypeString);
+    if (t && !t.isNil()) out.text = t.js;
+}
+JSON.stringify(out);
+`;
+}
+
+async function systemClipboard(mode: ContentMode): Promise<RawClipboard> {
+    const png = tempPng();
+    const parse = (out: string): RawClipboard & { image: boolean; } => {
+        const j = JSON.parse(out.trim() || "{}");
+        const files = j.files == null ? [] : Array.isArray(j.files) ? j.files : [j.files];
+        return { files: files.map(String).filter(Boolean), png: null, text: typeof j.text === "string" ? j.text : "", image: !!j.image };
+    };
+
+    if (process.platform === "win32") {
+        const encoded = Buffer.from(windowsScript(mode, png), "utf16le").toString("base64");
+        const r = parse(await run("powershell.exe", ["-NoProfile", "-NonInteractive", "-STA", "-ExecutionPolicy", "Bypass", "-EncodedCommand", encoded]));
+        return { files: r.files, text: r.text, png: r.image ? await takeFile(png) : null };
+    }
+    if (process.platform === "darwin") {
+        const r = parse(await run("osascript", ["-l", "JavaScript", "-e", macScript(mode, png)]));
+        return { files: r.files, text: r.text, png: r.image ? await takeFile(png) : null };
+    }
+
+    // Linux: Wayland first, then X11.
+    const tools: [string, (t: string) => string[]][] = [
+        ["wl-paste", t => ["--no-newline", "--type", t]],
+        ["xclip", t => ["-selection", "clipboard", "-o", "-t", t]]
+    ];
+    for (const [cmd, args] of tools) {
+        try {
+            const types = (await run(cmd, cmd === "wl-paste" ? ["--list-types"] : ["-selection", "clipboard", "-o", "-t", "TARGETS"])).split(/\r?\n/).map(t => t.trim());
+            const out: RawClipboard = { files: [], png: null, text: "" };
+            if (mode !== "text" && types.includes("text/uri-list")) out.files = fromFileUrls(await run(cmd, args("text/uri-list")));
+            if (mode !== "text" && !out.files.length && types.includes("image/png")) {
+                out.png = await new Promise<Buffer>((resolve, reject) => execFile(cmd, args("image/png"), { encoding: "buffer", maxBuffer: 64 * 1024 * 1024, timeout: 8000 }, (e, b) => (e ? reject(e) : resolve(b as Buffer))));
             }
+            if (mode !== "media" && !out.files.length && !out.png) {
+                const t = types.find(x => x === "text/plain;charset=utf-8" || x === "UTF8_STRING" || x === "text/plain");
+                if (t) out.text = await run(cmd, args(t));
+            }
+            return out;
+        } catch { /* tool missing: try the next one */ }
+    }
+    throw new Error("Couldn't read the clipboard: install wl-clipboard (Wayland) or xclip (X11)");
+}
+
+/** Copied files through Electron (Windows: PowerShell lists them when there's more than one). */
+async function electronFiles(c: ElectronClipboard): Promise<string[]> {
+    if (process.platform === "win32") {
+        // "FileNameW" only holds the FIRST copied file; it tells us cheaply whether files are there.
+        if (!isFn(c, "readBuffer")) return (await systemClipboard("media")).files;
+        const first = c.readBuffer!("FileNameW").toString("utf16le").replace(/\0[\s\S]*$/, "");
+        if (!first) return [];
+        try {
+            const out = await run("powershell.exe", [
+                "-NoProfile", "-NonInteractive", "-STA", "-ExecutionPolicy", "Bypass", "-Command",
+                "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; Get-Clipboard -Format FileDropList | ForEach-Object { $_.FullName }"
+            ]);
+            const all = out.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+            return all.length ? all : [first];
+        } catch (e) {
+            log("PowerShell file list failed, using the first file only:", e);
+            return [first];
         }
-        if (process.platform === "darwin") {
-            // A plist with every copied file; "public.file-url" as a fallback has only the first.
-            const plist = clipboard.read("NSFilenamesPboardType");
-            const paths = [...plist.matchAll(/<string>([^<]+)<\/string>/g)].map(m =>
-                m[1].replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, "\"").replace(/&apos;/g, "'"));
-            if (paths.length) return paths;
-            const url = clipboard.read("public.file-url");
-            return url.startsWith("file://") ? [fileURLToPath(url)] : [];
+    }
+    if (!isFn(c, "read")) return [];
+    if (process.platform === "darwin") {
+        const plist = c.read!("NSFilenamesPboardType") || "";
+        const paths = [...plist.matchAll(/<string>([^<]+)<\/string>/g)].map(m =>
+            m[1].replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, "\"").replace(/&apos;/g, "'"));
+        if (paths.length) return paths;
+        const url = c.read!("public.file-url") || "";
+        return url.startsWith("file://") ? [fileURLToPath(url)] : [];
+    }
+    return fromFileUrls(c.read!("text/uri-list") || "");
+}
+
+async function rawClipboard(mode: ContentMode): Promise<RawClipboard> {
+    if (pickRoute() !== "system") {
+        try {
+            const c = api!;
+            const out: RawClipboard = { files: [], png: null, text: "" };
+            if (mode !== "text") {
+                out.files = await electronFiles(c);
+                if (!out.files.length) {
+                    const img = c.readImage();
+                    if (img && !img.isEmpty()) out.png = img.toPNG();
+                }
+            }
+            if (mode !== "media" && !out.files.length && !out.png) out.text = c.readText() ?? "";
+            return out;
+        } catch (e) {
+            // Something in there broke at runtime: use the OS from now on.
+            log("Electron clipboard failed, switching to the OS route:", e);
+            clipRoute = "system";
+            routeNote = `electron failed: ${String((e as Error)?.message ?? e)}`;
         }
-        const list = clipboard.read("text/uri-list") || "";
-        return list.split(/\r?\n/).map(l => l.trim()).filter(l => l.startsWith("file://")).map(l => fileURLToPath(l));
-    } catch (e) {
-        log("Reading copied files failed:", e);
-        return [];
+    }
+    try {
+        return await systemClipboard(mode);
+    } catch (e: any) {
+        const why = String(e?.stderr || e?.message || e).split(/\r?\n/).find(l => l.trim()) ?? "unknown error";
+        throw Object.assign(new Error(`Couldn't read the clipboard (${why.trim().slice(0, 160)})`), { status: 500 });
     }
 }
 
@@ -146,48 +345,41 @@ const stamp = () => {
 };
 
 async function readClipboard(mode: ContentMode): Promise<Snapshot> {
-    const snap: Snapshot = { id: Math.random().toString(36).slice(2, 10) + Date.now().toString(36), at: Date.now(), kind: "empty", items: [], text: "", skipped: [] };
+    const snap: Snapshot = { id: randomBytes(8).toString("hex"), at: Date.now(), kind: "empty", items: [], text: "", skipped: [] };
+    const raw = await rawClipboard(mode);
 
-    if (mode !== "text") {
-        const paths = await clipboardFiles();
-        if (paths.length) {
-            if (paths.length > MAX_FILES) throw Object.assign(new Error(`Too many files (${paths.length}). At most ${MAX_FILES} at once.`), { status: 400 });
-            for (const path of paths) {
-                try {
-                    const st = await fs.stat(path);
-                    if (!st.isFile()) {
-                        snap.skipped.push(`${basename(path)} (folder)`);
-                        continue;
-                    }
-                    if (st.size > MAX_FILE_BYTES) {
-                        snap.skipped.push(`${basename(path)} (too big)`);
-                        continue;
-                    }
-                    const name = basename(path);
-                    snap.items.push({ name, size: st.size, type: mimeOf(name), path, mtimeMs: st.mtimeMs });
-                } catch {
-                    snap.skipped.push(`${basename(path)} (not found)`);
+    if (raw.files.length) {
+        if (raw.files.length > MAX_FILES) throw Object.assign(new Error(`Too many files (${raw.files.length}). At most ${MAX_FILES} at once.`), { status: 400 });
+        for (const path of raw.files) {
+            try {
+                const st = await fs.stat(path);
+                if (!st.isFile()) {
+                    snap.skipped.push(`${basename(path)} (folder)`);
+                    continue;
                 }
+                if (st.size > MAX_FILE_BYTES) {
+                    snap.skipped.push(`${basename(path)} (too big)`);
+                    continue;
+                }
+                const name = basename(path);
+                snap.items.push({ name, size: st.size, type: mimeOf(name), path, mtimeMs: st.mtimeMs });
+            } catch {
+                snap.skipped.push(`${basename(path)} (not found)`);
             }
-            snap.kind = snap.items.length ? "files" : "empty";
-            return keep(snap);
         }
-
-        const img = clipboard.readImage();
-        if (!img.isEmpty()) {
-            const data = img.toPNG();
-            snap.kind = "image";
-            snap.items.push({ name: `image_${stamp()}.png`, size: data.length, type: "image/png", data });
-            return keep(snap);
-        }
+        snap.kind = snap.items.length ? "files" : "empty";
+        return keep(snap);
     }
 
-    if (mode !== "media") {
-        const text = clipboard.readText();
-        if (text.trim()) {
-            snap.kind = "text";
-            snap.text = text.length > MAX_TEXT ? text.slice(0, MAX_TEXT) : text;
-        }
+    if (raw.png?.length) {
+        snap.kind = "image";
+        snap.items.push({ name: `image_${stamp()}.png`, size: raw.png.length, type: "image/png", data: raw.png });
+        return keep(snap);
+    }
+
+    if (raw.text.trim()) {
+        snap.kind = "text";
+        snap.text = raw.text.length > MAX_TEXT ? raw.text.slice(0, MAX_TEXT) : raw.text;
     }
     return keep(snap);
 }
@@ -304,7 +496,8 @@ async function handle(req: IncomingMessage, res: ServerResponse) {
 
     switch (path) {
         case "/health":
-            return send(res, 200, { ok: true, name: NAME, version: VERSION, renderer: rendererAlive() });
+            pickRoute();
+            return send(res, 200, { ok: true, name: NAME, version: VERSION, renderer: rendererAlive(), clipboard: clipRoute, clipboardDetail: routeNote });
 
         case "/peek": {
             if (isPost) return send(res, 405, { error: "Method not allowed" });
@@ -408,7 +601,7 @@ export function hasSnapshot(_: IpcMainInvokeEvent, snapshotId: string): boolean 
 /** Bring Discord to the front, for the confirmation dialog. */
 export function focusWindow(_: IpcMainInvokeEvent) {
     if (!rendererAlive()) return;
-    const win = BrowserWindow.fromWebContents(renderer!);
+    const win = electron.BrowserWindow?.fromWebContents?.(renderer!);
     if (!win) return;
     if (win.isMinimized()) win.restore();
     win.show();

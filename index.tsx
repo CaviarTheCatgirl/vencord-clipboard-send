@@ -36,7 +36,7 @@ import type { SnapshotSummary } from "./native";
 const Native = VencordNative.pluginHelpers.ClipboardSendDeck as PluginNative<typeof import("./native")>;
 const CloudUpload: typeof TCloudUpload = findLazy(m => m.prototype?.trackUploadFinished);
 
-const VERSION = "1.0.0";
+const VERSION = "1.0.1";
 const TAG = "[ClipboardSendDeck]";
 const ID_RE = /^\d{15,22}$/;
 const MB = 1024 * 1024;

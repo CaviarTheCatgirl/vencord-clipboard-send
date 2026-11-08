@@ -5,7 +5,7 @@ Send whatever is on your clipboard (files, an image or text) to **a whole list o
 This is the **Discord side**. It pairs with the [Discord Clipboard Send Stream Deck plugin](https://github.com/CaviarTheCatgirl/streamdeck-clipboard-send).
 
 ![Vencord](https://img.shields.io/badge/Vencord-userplugin-5865F2)
-![Version](https://img.shields.io/badge/version-1.0.0-green)
+![Version](https://img.shields.io/badge/version-1.0.1-green)
 ![License](https://img.shields.io/badge/license-GPL--3.0--or--later-blue)
 
 ## Features
@@ -92,7 +92,7 @@ All endpoints are on `http://127.0.0.1:37322`.
 
 | Method | Path | Body / query | Returns |
 |---|---|---|---|
-| `GET` | `/health` | | `{ ok, name, version, renderer }` |
+| `GET` | `/health` | | `{ ok, name, version, renderer, clipboard, clipboardDetail }` |
 | `GET` | `/status` | | `{ name, version, me, fileLimit, textLimit, maxRecipients, busy }` |
 | `GET` | `/peek?content=auto\|media\|text` | | `{ snapshot }` of what's on the clipboard now (nothing kept) |
 | `POST` | `/prepare` | `{ content }` | `{ snapshot }`, kept for 15 min |
@@ -119,6 +119,9 @@ Discord sometimes asks for a captcha when opening a new DM. Open the DM by hand 
 
 ### "No permission to attach files there" / "Forum channels need a post"
 The channel only allows text for you, or it's a forum. For forums, pick a thread: paste its link in the Stream Deck settings.
+
+### "Couldn't read the clipboard (…)"
+All three ways to read the clipboard failed; the reason is in the brackets. Open `http://127.0.0.1:37322/health` in a terminal (`curl`, not a browser: browsers are refused) to see which way the plugin tried (`clipboard`, `clipboardDetail`). On Windows the fallback needs `powershell.exe`.
 
 ### Only the first copied file is sent (Windows)
 PowerShell couldn't list the files, so the plugin fell back to the first one. Check that `powershell.exe` runs on your PC.
@@ -157,6 +160,10 @@ GPL-3.0-or-later
 - [Vencord User Volume Deck](https://github.com/CaviarTheCatgirl/vencord-user-volume): one person's volume on a key or dial
 
 ## Changelog
+
+### v1.0.1
+- 🐛 **Fixed: nothing could be sent** ("clipboard.readImage is not a function"). On some Discord builds the clipboard Electron hands to Vencord plugins is missing its read functions. The plugin now tries Electron's clipboard, then Electron's built-in clipboard binding, then reads the clipboard straight from the OS (one PowerShell call on Windows, osascript on macOS, wl-paste / xclip on Linux).
+- 🩺 `GET /health` now says which way the clipboard is read (`clipboard: electron | binding | system`).
 
 ### v1.0.0 (initial release)
 - ✨ Clipboard (files, image or text) to many people and channels in one go
