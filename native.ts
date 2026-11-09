@@ -338,6 +338,22 @@ async function rawClipboard(mode: ContentMode): Promise<RawClipboard> {
     }
 }
 
+// Human ("natural") order: Catgirl 1, 2, … 9, 10, 11, … 99, 100, 101 … – not 1, 10, 100, 11.
+// Case and accents don't matter; the name is compared before the extension, so
+// "Catgirl.png" comes before "Catgirl 2.png" like in Explorer.
+const naturalCollator = new Intl.Collator(undefined, { numeric: true, sensitivity: "base" });
+const splitExt = (name: string): [string, string] => {
+    const dot = name.lastIndexOf(".");
+    return dot > 0 ? [name.slice(0, dot), name.slice(dot + 1)] : [name, ""];
+};
+function naturalCompare(a: string, b: string): number {
+    const [aStem, aExt] = splitExt(a);
+    const [bStem, bExt] = splitExt(b);
+    return naturalCollator.compare(aStem, bStem)
+        || naturalCollator.compare(aExt, bExt)
+        || (a < b ? -1 : a > b ? 1 : 0); // stable tie-break, e.g. "a.png" vs "A.png"
+}
+
 const stamp = () => {
     const d = new Date();
     const p = (n: number) => String(n).padStart(2, "0");
@@ -367,6 +383,9 @@ async function readClipboard(mode: ContentMode): Promise<Snapshot> {
                 snap.skipped.push(`${basename(path)} (not found)`);
             }
         }
+        // The OS hands copied files over in selection order, not name order. Sort them so
+        // they upload (and show in the preview) as Catgirl 1, 2, … 10, … 100.
+        snap.items.sort((a, b) => naturalCompare(a.name, b.name));
         snap.kind = snap.items.length ? "files" : "empty";
         return keep(snap);
     }
