@@ -33,7 +33,7 @@
 // the Host header must be 127.0.0.1 / localhost (stops DNS rebinding).
 
 import { execFile } from "child_process";
-import { randomBytes } from "crypto";
+import { createHash, randomBytes } from "crypto";
 import type { IpcMainInvokeEvent, WebContents } from "electron";
 import * as electron from "electron";
 import { promises as fs } from "fs";
@@ -73,6 +73,9 @@ interface Item {
     mtimeMs?: number;
     /** image: the PNG bytes */
     data?: Buffer;
+    /** image, quick peek only: its size in pixels (no PNG made, so no byte size either) */
+    width?: number;
+    height?: number;
 }
 
 interface Snapshot {
@@ -115,11 +118,17 @@ function run(cmd: string, args: string[], timeout = 8000): Promise<string> {
 //   3. The OS itself: one PowerShell call on Windows (files, image or text in one go),
 //      osascript / JXA on macOS, wl-paste / xclip on Linux.
 
-interface RawClipboard { files: string[]; png: Buffer | null; text: string; }
+interface RawClipboard {
+    files: string[];
+    png: Buffer | null;
+    text: string;
+    /** quick peek of an image: only its size, the PNG isn't made */
+    imageSize?: { width: number; height: number; };
+}
 
 interface ElectronClipboard {
     readText(): string;
-    readImage(): { isEmpty(): boolean; toPNG(): Buffer; };
+    readImage(): { isEmpty(): boolean; toPNG(): Buffer; getSize?(): { width: number; height: number; }; };
     readBuffer?(format: string): Buffer;
     read?(format: string): string;
 }
@@ -278,6 +287,21 @@ async function systemClipboard(mode: ContentMode): Promise<RawClipboard> {
     throw new Error("Couldn't read the clipboard: install wl-clipboard (Wayland) or xclip (X11)");
 }
 
+// Windows: Explorer also puts the copied items on the clipboard as a "Shell IDList Array".
+// While those bytes (and the first file) stay the same, so does the list of files.
+const FILE_LIST_TTL_MS = 60_000;
+let fileListCache: { key: string; at: number; list: Promise<string[]>; } | null = null;
+
+function shellListKey(c: ElectronClipboard, first: string): string {
+    try {
+        const ids = c.readBuffer!("Shell IDList Array");
+        if (!ids?.length) return ""; // not copied from Explorer: no key, always ask PowerShell
+        return createHash("sha1").update(ids).update(first).digest("hex");
+    } catch {
+        return "";
+    }
+}
+
 /** Copied files through Electron (Windows: PowerShell lists them when there's more than one). */
 async function electronFiles(c: ElectronClipboard): Promise<string[]> {
     if (process.platform === "win32") {
@@ -285,13 +309,30 @@ async function electronFiles(c: ElectronClipboard): Promise<string[]> {
         if (!isFn(c, "readBuffer")) return (await systemClipboard("media")).files;
         const first = c.readBuffer!("FileNameW").toString("utf16le").replace(/\0[\s\S]*$/, "");
         if (!first) return [];
-        try {
-            const out = await run("powershell.exe", [
-                "-NoProfile", "-NonInteractive", "-STA", "-ExecutionPolicy", "Bypass", "-Command",
-                "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; Get-Clipboard -Format FileDropList | ForEach-Object { $_.FullName }"
-            ]);
+        // Starting PowerShell is the slow part (often a second). The same copied files give the
+        // same list, so a peek followed by a send (or two peeks) only start it once.
+        const key = shellListKey(c, first);
+        const now = Date.now();
+        if (key && fileListCache && fileListCache.key === key && now - fileListCache.at < FILE_LIST_TTL_MS) {
+            try {
+                return await fileListCache.list;
+            } catch { /* that run failed: start a new one below */ }
+        }
+        const list = run("powershell.exe", [
+            "-NoProfile", "-NonInteractive", "-STA", "-ExecutionPolicy", "Bypass", "-Command",
+            "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; Get-Clipboard -Format FileDropList | ForEach-Object { $_.FullName }"
+        ]).then(out => {
             const all = out.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
-            return all.length ? all : [first];
+            if (!all.length) throw new Error("PowerShell listed no files");
+            return all;
+        });
+        if (key) {
+            const entry = { key, at: now, list };
+            fileListCache = entry;
+            list.catch(() => { if (fileListCache === entry) fileListCache = null; });
+        }
+        try {
+            return await list;
         } catch (e) {
             log("PowerShell file list failed, using the first file only:", e);
             return [first];
@@ -309,7 +350,7 @@ async function electronFiles(c: ElectronClipboard): Promise<string[]> {
     return fromFileUrls(c.read!("text/uri-list") || "");
 }
 
-async function rawClipboard(mode: ContentMode): Promise<RawClipboard> {
+async function rawClipboard(mode: ContentMode, quick = false): Promise<RawClipboard> {
     if (pickRoute() !== "system") {
         try {
             const c = api!;
@@ -318,10 +359,16 @@ async function rawClipboard(mode: ContentMode): Promise<RawClipboard> {
                 out.files = await electronFiles(c);
                 if (!out.files.length) {
                     const img = c.readImage();
-                    if (img && !img.isEmpty()) out.png = img.toPNG();
+                    if (img && !img.isEmpty()) {
+                        // A quick peek only needs to know there's an image: making the PNG of a big
+                        // screenshot blocks Discord for a moment, so it waits until it's sent.
+                        const size = quick && isFn(img, "getSize") ? img.getSize!() : null;
+                        if (size?.width) out.imageSize = size;
+                        else out.png = img.toPNG();
+                    }
                 }
             }
-            if (mode !== "media" && !out.files.length && !out.png) out.text = c.readText() ?? "";
+            if (mode !== "media" && !out.files.length && !out.png && !out.imageSize) out.text = c.readText() ?? "";
             return out;
         } catch (e) {
             // Something in there broke at runtime: use the OS from now on.
@@ -360,9 +407,9 @@ const stamp = () => {
     return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}_${p(d.getHours())}-${p(d.getMinutes())}-${p(d.getSeconds())}`;
 };
 
-async function readClipboard(mode: ContentMode): Promise<Snapshot> {
+async function readClipboard(mode: ContentMode, quick = false): Promise<Snapshot> {
     const snap: Snapshot = { id: randomBytes(8).toString("hex"), at: Date.now(), kind: "empty", items: [], text: "", skipped: [] };
-    const raw = await rawClipboard(mode);
+    const raw = await rawClipboard(mode, quick);
 
     if (raw.files.length) {
         if (raw.files.length > MAX_FILES) throw Object.assign(new Error(`Too many files (${raw.files.length}). At most ${MAX_FILES} at once.`), { status: 400 });
@@ -388,6 +435,13 @@ async function readClipboard(mode: ContentMode): Promise<Snapshot> {
         snap.items.sort((a, b) => naturalCompare(a.name, b.name));
         snap.kind = snap.items.length ? "files" : "empty";
         return keep(snap);
+    }
+
+    if (raw.imageSize) {
+        // quick peek: nothing is kept, so no PNG is needed
+        snap.kind = "image";
+        snap.items.push({ name: "image.png", size: 0, type: "image/png", ...raw.imageSize });
+        return snap;
     }
 
     if (raw.png?.length) {
@@ -420,7 +474,7 @@ function summary(s: Snapshot) {
         kind: s.kind,
         count: s.kind === "text" ? 1 : s.items.length,
         bytes: s.kind === "text" ? Buffer.byteLength(s.text) : s.items.reduce((a, i) => a + i.size, 0),
-        items: s.items.map(i => ({ name: i.name, size: i.size, type: i.type })),
+        items: s.items.map(i => ({ name: i.name, size: i.size, type: i.type, ...(i.width ? { width: i.width, height: i.height } : {}) })),
         text: s.kind === "text" ? s.text : "",
         textLength: s.text.length,
         skipped: s.skipped
@@ -520,7 +574,8 @@ async function handle(req: IncomingMessage, res: ServerResponse) {
 
         case "/peek": {
             if (isPost) return send(res, 405, { error: "Method not allowed" });
-            const snap = await readClipboard(modeOf(args.content));
+            // quick=1 (holding the key): skip what only a send needs, like making the PNG
+            const snap = await readClipboard(modeOf(args.content), args.quick === "1" || args.quick === true);
             snapshots.delete(snap.id); // a peek keeps nothing
             return send(res, 200, { snapshot: { ...summary(snap), id: null } });
         }
