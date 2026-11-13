@@ -5,7 +5,7 @@ Send whatever is on your clipboard (files, an image or text) to **a whole list o
 This is the **Discord side**. It pairs with the [Discord Clipboard Send Stream Deck plugin](https://github.com/CaviarTheCatgirl/streamdeck-clipboard-send).
 
 ![Vencord](https://img.shields.io/badge/Vencord-userplugin-5865F2)
-![Version](https://img.shields.io/badge/version-1.0.1-green)
+![Version](https://img.shields.io/badge/version-1.1.0-green)
 ![License](https://img.shields.io/badge/license-GPL--3.0--or--later-blue)
 
 ## Features
@@ -63,9 +63,9 @@ Everything else (who gets it, message, spoiler, confirmation, gestures) is set p
 
 ## What happens when you press the key
 
-1. The clipboard is read **in Discord's main process** (Electron's clipboard; on Windows a short PowerShell call lists every copied file) and frozen as a snapshot: names and sizes, never the paths, go to the Stream Deck.
+1. The clipboard is read **in Discord's main process** (Electron's clipboard; on Windows one PowerShell kept ready in the background lists the copied files when there are several, so a press doesn't wait for PowerShell to start) and frozen as a snapshot: names and sizes, never the paths, go to the Stream Deck. A clipboard that another program holds for a moment is read again instead of counting as empty.
 2. If you asked for it, Discord shows the **confirmation dialog**, and brings itself to the front if the key says so.
-3. Targets are sent to **one after another**: open the DM (or check the channel's permissions), upload the files with Discord's own uploader, post the message. Then the pause, then the next.
+3. Targets are sent to **one after another**: open the DM (or check the channel's permissions), upload the files with Discord's own uploader (up to 3 at once), post the message. During the pause after each one, the next person is already made ready (DM opened, files uploading), so the pause no longer adds to the total time. From the second person on, the first upload is reused when Discord accepts it (nothing uploads again); if it doesn't, every person gets their own upload as before.
 4. The Stream Deck key shows progress and the result; the Stream Deck settings panel lists who got it and who didn't, and why.
 
 Snapshots are kept 15 minutes (for **Retry failed**) and only ever in memory.

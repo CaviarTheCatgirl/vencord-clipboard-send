@@ -36,7 +36,7 @@ import type { SnapshotSummary } from "./native";
 const Native = VencordNative.pluginHelpers.ClipboardSendDeck as PluginNative<typeof import("./native")>;
 const CloudUpload: typeof TCloudUpload = findLazy(m => m.prototype?.trackUploadFinished);
 
-const VERSION = "1.0.1";
+const VERSION = "1.1.0";
 const TAG = "[ClipboardSendDeck]";
 const ID_RE = /^\d{15,22}$/;
 const MB = 1024 * 1024;
@@ -45,6 +45,8 @@ const FILES_PER_MESSAGE = 10;
 const MAX_JOBS_KEPT = 20;
 /** Files up to this total are read once and reused for every person. */
 const CACHE_BYTES = 150 * MB;
+/** Files of one message uploading at the same time. */
+const PARALLEL_UPLOADS = 3;
 
 const settings = definePluginSettings({
     port: {
@@ -213,7 +215,7 @@ const spoilerName = (name: string) => (name.startsWith("SPOILER_") ? name : `SPO
 // ── errors ──────────────────────────────────────────────────────────────────
 
 class ApiError extends Error { }
-class SendError extends Error { }
+class SendError extends Error { status = 0; }
 /** The copied content itself is unusable (changed, expired): nobody else can get it either. */
 class ContentError extends SendError { }
 class Cancelled extends Error { }
@@ -251,7 +253,7 @@ async function rest<T>(fn: () => Promise<T>, job?: Job): Promise<T> {
                 if (job) job.note = "";
                 continue;
             }
-            throw new SendError(describe(e));
+            throw Object.assign(new SendError(describe(e)), { status: Number(e?.status) || 0 });
         }
     }
 }
@@ -283,7 +285,15 @@ interface Job extends JobOptions {
     error: string;
     note: string;
     files: Map<number, Uint8Array>;
+    /** The first person's uploads: the next ones try to reuse them (no second upload). */
+    shared: Uploaded[] | null;
+    /** Whether Discord took the reused uploads: unknown (null) until the second person. */
+    reuse: boolean | null;
 }
+
+interface Uploaded { filename: string; uploaded_filename: string; }
+/** One person / channel made ready while the previous one is still pausing. */
+interface Prepared { channelId: string; note: string; uploads: Promise<Uploaded[]> | null; }
 
 const jobs = new Map<string, Job>();
 let queue: Promise<void> = Promise.resolve();
@@ -348,6 +358,10 @@ async function run(job: Job) {
     if (job.state === "cancelled") return; // cancelled while waiting in the queue
     if (job.cancelled) return finish(job, "cancelled");
     job.state = "sending";
+    // The next person is made ready (DM opened, files uploading) DURING the pause after the
+    // current one: the pause still spaces the messages out, but no longer adds to the time.
+    let ahead: { index: number; p: Promise<Prepared>; } | null = null;
+    const nextWaiting = (from: number) => job.results.findIndex((x, k) => k > from && x.state === "waiting");
     for (let i = 0; i < job.results.length; i++) {
         const r = job.results[i];
         if (r.state !== "waiting") continue;
@@ -356,7 +370,9 @@ async function run(job: Job) {
         job.frac = 0;
         r.state = "sending";
         try {
-            await sendTo(job, r);
+            const prep = ahead?.index === i ? ahead.p : prepare(job, r, i);
+            ahead = null;
+            await deliver(job, r, i, await prep);
             r.state = "sent";
         } catch (e) {
             if (e instanceof Cancelled) {
@@ -374,7 +390,11 @@ async function run(job: Job) {
         }
         job.frac = 0;
         // Space people out, unless this was the last one.
-        if (job.results.slice(i + 1).some(x => x.state === "waiting")) {
+        const n = nextWaiting(i);
+        if (n >= 0) {
+            const p = prepare(job, job.results[n], n);
+            p.catch(() => { }); // reported when it's that person's turn
+            ahead = { index: n, p };
             const until = Date.now() + job.delayMs * (1 + Math.random() * 0.2);
             while (Date.now() < until && !job.cancelled) await sleep(100);
         }
@@ -440,10 +460,12 @@ async function postMessage(job: Job, channelId: string, content: string, attachm
     }), job);
 }
 
-async function sendTo(job: Job, r: Result) {
+const withFilesFor = (job: Job) => job.snapshot.kind !== "text" || job.snapshot.text.length + job.message.length + 1 > textLimit();
+
+/** Everything for one target that can happen before its message: checks, DM, uploads. */
+async function prepare(job: Job, r: Result, index: number): Promise<Prepared> {
     const snap = job.snapshot;
-    const limit = textLimit();
-    const withFiles = snap.kind !== "text" || snap.text.length + job.message.length + 1 > limit;
+    const withFiles = withFilesFor(job);
     let channelId: string;
     if (r.kind === "channel") {
         const why = cantPost(ChannelStore.getChannel(r.id), withFiles);
@@ -455,7 +477,59 @@ async function sendTo(job: Job, r: Result) {
     const maxFile = limitFor(r.kind === "channel" ? channelId : null);
     const big = snap.items.find(i => i.size > maxFile);
     if (big) throw new SendError(`${big.name} is over the ${formatBytes(maxFile)} limit here`);
-    let note = fill(job.message, r.id, job.results.length, r.kind).slice(0, limit);
+    const note = fill(job.message, r.id, job.results.length, r.kind).slice(0, textLimit());
+    // Files: upload now — unless the first person's uploads are about to be (or are) reused.
+    const reusing = snap.kind !== "text" && job.shared && job.reuse !== false && snap.items.length <= FILES_PER_MESSAGE;
+    const uploads = snap.kind !== "text" && !reusing ? uploadAll(job, channelId, index) : null;
+    uploads?.catch(() => { });
+    return { channelId, note, uploads };
+}
+
+/** Uploads every file of the snapshot, a few at a time, in their order. */
+async function uploadAll(job: Job, channelId: string, index: number): Promise<Uploaded[]> {
+    const { items } = job.snapshot;
+    const out: Uploaded[] = new Array(items.length);
+    const frac = new Array(items.length).fill(0);
+    const report = () => { if (job.current === index) job.frac = frac.reduce((a, b) => a + b, 0) / items.length * 0.95; };
+    let next = 0, broken = false;
+    const worker = async () => {
+        while (!broken && next < items.length) {
+            const i = next++;
+            const item = items[i];
+            let bytes: Uint8Array;
+            try {
+                bytes = await itemBytes(job, i);
+            } catch (e: any) {
+                throw new ContentError(String(e?.message ?? e).replace(/^Error invoking remote method '[^']+': (Error: )?/, ""));
+            }
+            const file = new File([bytes as BlobPart], job.spoiler ? spoilerName(item.name) : item.name, { type: item.type });
+            const up = await upload(file, channelId, job, f => { frac[i] = f; report(); });
+            out[i] = { filename: up.filename, uploaded_filename: up.uploadedFilename };
+            frac[i] = 1;
+            report();
+        }
+    };
+    try {
+        await Promise.all(Array.from({ length: Math.min(PARALLEL_UPLOADS, items.length) }, worker));
+    } catch (e) {
+        broken = true;
+        throw e;
+    }
+    return out;
+}
+
+/** Posts the files in messages of 10 (the note with the first one). */
+async function postFiles(job: Job, channelId: string, note: string, up: Uploaded[]) {
+    for (let start = 0; start < up.length; start += FILES_PER_MESSAGE) {
+        const batch = up.slice(start, start + FILES_PER_MESSAGE).map((u, k) => ({ id: String(k), filename: u.filename, uploaded_filename: u.uploaded_filename }));
+        await postMessage(job, channelId, start === 0 ? note : "", batch);
+    }
+}
+
+async function deliver(job: Job, r: Result, index: number, pre: Prepared) {
+    const snap = job.snapshot;
+    const { channelId, note } = pre;
+    const limit = textLimit();
 
     if (snap.kind === "text") {
         const body = job.spoiler ? `||${snap.text}||` : snap.text;
@@ -467,27 +541,24 @@ async function sendTo(job: Job, r: Result) {
         return postMessage(job, channelId, note, [{ id: "0", filename: up.filename, uploaded_filename: up.uploadedFilename }]);
     }
 
-    const { items } = snap;
-    let done = 0;
-    for (let start = 0; start < items.length; start += FILES_PER_MESSAGE) {
-        const attachments: any[] = [];
-        for (let i = start; i < Math.min(items.length, start + FILES_PER_MESSAGE); i++) {
-            const item = items[i];
-            let bytes: Uint8Array;
-            try {
-                bytes = await itemBytes(job, i);
-            } catch (e: any) {
-                throw new ContentError(String(e?.message ?? e).replace(/^Error invoking remote method '[^']+': (Error: )?/, ""));
-            }
-            const file = new File([bytes as BlobPart], job.spoiler ? spoilerName(item.name) : item.name, { type: item.type });
-            const up = await upload(file, channelId, job, f => { job.frac = (done + f) / items.length * 0.95; });
-            attachments.push({ id: String(attachments.length), filename: up.filename, uploaded_filename: up.uploadedFilename });
-            done++;
-            job.frac = done / items.length * 0.95;
+    // Already uploaded for an earlier person: try sending the same uploads again (much faster:
+    // nothing to upload). If Discord doesn't take them, upload for this one as usual and stop
+    // trying for the rest of this send.
+    // (Only for one message's worth of files: a half-reused send can't be taken back.)
+    if (!pre.uploads && job.shared && job.reuse !== false && job.shared.length <= FILES_PER_MESSAGE) {
+        try {
+            await postFiles(job, channelId, note, job.shared);
+            job.reuse = true;
+            return;
+        } catch (e) {
+            if (!(e instanceof SendError) || e instanceof ContentError || ![400, 404].includes(e.status)) throw e;
+            console.info(TAG, "Discord didn't take reused uploads, uploading for each person", e);
+            job.reuse = false;
         }
-        await postMessage(job, channelId, note, attachments);
-        note = ""; // the note only goes with the first message
     }
+    const up = await (pre.uploads ?? uploadAll(job, channelId, index));
+    await postFiles(job, channelId, note, up);
+    if (!job.shared) job.shared = up;
 }
 
 // ── confirmation dialog ─────────────────────────────────────────────────────
@@ -645,7 +716,9 @@ function newJob(snapshot: SnapshotSummary, people: Result[], opts: JobOptions): 
         cancelled: false,
         error: "",
         note: "",
-        files: new Map()
+        files: new Map(),
+        shared: null,
+        reuse: null
     };
 }
 

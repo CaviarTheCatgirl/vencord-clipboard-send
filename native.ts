@@ -32,7 +32,7 @@
 // bodies must be JSON (forces a CORS preflight, which gets no CORS headers) and
 // the Host header must be 127.0.0.1 / localhost (stops DNS rebinding).
 
-import { execFile } from "child_process";
+import { type ChildProcessWithoutNullStreams, execFile, spawn } from "child_process";
 import { createHash, randomBytes } from "crypto";
 import type { IpcMainInvokeEvent, WebContents } from "electron";
 import * as electron from "electron";
@@ -43,7 +43,7 @@ import { basename, extname, join } from "path";
 import { fileURLToPath } from "url";
 
 const NAME = "ClipboardSendDeck";
-const VERSION = "1.0.1";
+const VERSION = "1.1.0";
 const DEFAULT_PORT = 37322;
 const MAX_BODY = 256 * 1024;
 const MAX_FILES = 30;
@@ -186,37 +186,167 @@ async function takeFile(path: string): Promise<Buffer | null> {
     }
 }
 
-/** Windows: one PowerShell (STA) run answers files → image → text, as JSON. */
-function windowsScript(mode: ContentMode, png: string): string {
-    const q = (v: string) => `'${v.replace(/'/g, "''")}'`;
-    return `
+// Windows: reading the clipboard with .NET. Another program may hold the clipboard open for a
+// moment (clipboard managers, the app that just copied): every read is tried a few times.
+const WIN_READ = `
+function Try-Clip([scriptblock]$f) {
+    for ($i = 0; $i -lt 8; $i++) { try { return & $f } catch { Start-Sleep -Milliseconds 60 } }
+    return & $f
+}
+function Read-Clip([string]$mode, [string]$png) {
+    $out = @{ files = @(); image = $false; text = $null }
+    if ($mode -ne 'text') {
+        $list = Try-Clip { [System.Windows.Forms.Clipboard]::GetFileDropList() }
+        if ($list -and $list.Count -gt 0) { $out.files = @($list | ForEach-Object { [string]$_ }) }
+        elseif ($mode -ne 'files') {
+            $data = Try-Clip { [System.Windows.Forms.Clipboard]::GetDataObject() }
+            if ($data -and $data.GetDataPresent('PNG')) {
+                $ms = $data.GetData('PNG')
+                if ($ms -is [System.IO.MemoryStream]) { [System.IO.File]::WriteAllBytes($png, $ms.ToArray()); $out.image = $true }
+            }
+            if (-not $out.image -and (Try-Clip { [System.Windows.Forms.Clipboard]::ContainsImage() })) {
+                $img = Try-Clip { [System.Windows.Forms.Clipboard]::GetImage() }
+                if ($img) { $img.Save($png, [System.Drawing.Imaging.ImageFormat]::Png); $img.Dispose(); $out.image = $true }
+            }
+        }
+    }
+    if ($mode -ne 'media' -and $mode -ne 'files' -and $out.files.Count -eq 0 -and -not $out.image -and (Try-Clip { [System.Windows.Forms.Clipboard]::ContainsText() })) {
+        $out.text = Try-Clip { [System.Windows.Forms.Clipboard]::GetText() }
+    }
+    return $out
+}
+`;
+const WIN_HEAD = `
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
-$mode = ${q(mode)}
-$out = @{ files = @(); image = $false; text = $null }
-if ($mode -ne 'text') {
-    $list = [System.Windows.Forms.Clipboard]::GetFileDropList()
-    if ($list -and $list.Count -gt 0) { $out.files = @($list | ForEach-Object { [string]$_ }) }
-    else {
-        $data = [System.Windows.Forms.Clipboard]::GetDataObject()
-        if ($data -and $data.GetDataPresent('PNG')) {
-            $ms = $data.GetData('PNG')
-            if ($ms -is [System.IO.MemoryStream]) { [System.IO.File]::WriteAllBytes(${q(png)}, $ms.ToArray()); $out.image = $true }
-        }
-        if (-not $out.image -and [System.Windows.Forms.Clipboard]::ContainsImage()) {
-            $img = [System.Windows.Forms.Clipboard]::GetImage()
-            if ($img) { $img.Save(${q(png)}, [System.Drawing.Imaging.ImageFormat]::Png); $img.Dispose(); $out.image = $true }
-        }
-    }
-}
-if ($mode -ne 'media' -and $out.files.Count -eq 0 -and -not $out.image -and [System.Windows.Forms.Clipboard]::ContainsText()) {
-    $out.text = [System.Windows.Forms.Clipboard]::GetText()
-}
-ConvertTo-Json -InputObject $out -Compress -Depth 3
+`;
+
+/** Windows: one PowerShell (STA) run answers files → image → text, as JSON. */
+function windowsScript(mode: ContentMode | "files", png: string): string {
+    const q = (v: string) => `'${v.replace(/'/g, "''")}'`;
+    return `${WIN_HEAD}${WIN_READ}
+ConvertTo-Json -InputObject (Read-Clip ${q(mode)} ${q(png)}) -Compress -Depth 3
 `;
 }
+
+// ── Windows: a PowerShell kept ready ────────────────────────────────────────
+// Starting PowerShell takes 1–5 s (more right after boot, or while an antivirus scans it). That
+// start was paid on every press with more than one copied file — the reason a press could time
+// out or only send the first file. Now ONE PowerShell (STA, as the clipboard needs) starts in
+// the background and answers requests line by line; it quits after 20 min unused and starts
+// again on the next use, or as soon as the Stream Deck checks in.
+const PS_LOOP = `${WIN_HEAD}
+[Console]::InputEncoding = [System.Text.Encoding]::UTF8
+${WIN_READ}
+[Console]::Out.WriteLine('{"ready":true}'); [Console]::Out.Flush()
+while ($true) {
+    $line = [Console]::In.ReadLine()
+    if ($null -eq $line) { break }
+    $id = $null
+    try {
+        $req = $line | ConvertFrom-Json
+        $id = $req.id
+        $out = Read-Clip ([string]$req.mode) ([string]$req.png)
+        $out.id = $id
+    } catch { $out = @{ id = $id; error = $_.Exception.Message } }
+    [Console]::Out.WriteLine((ConvertTo-Json -InputObject $out -Compress -Depth 3))
+    [Console]::Out.Flush()
+}
+`;
+const PS_IDLE_MS = 20 * 60_000;
+
+class PsHost {
+    private p: ChildProcessWithoutNullStreams | null = null;
+    private ready: Promise<void> | null = null;
+    private buf = "";
+    private wait = new Map<string, { res: (v: any) => void; rej: (e: Error) => void; }>();
+    private chain: Promise<unknown> = Promise.resolve();
+    private idle: NodeJS.Timeout | null = null;
+
+    /** Start it now (in the background) so the next press doesn't wait for it. */
+    warm(): void {
+        if (process.platform !== "win32") return;
+        try { this.ensure().catch(() => { }); } catch { /* */ }
+        this.touch();
+    }
+
+    private touch() {
+        if (this.idle) clearTimeout(this.idle);
+        this.idle = setTimeout(() => this.stop(), PS_IDLE_MS);
+    }
+
+    stop() {
+        const p = this.p;
+        this.p = null; this.ready = null;
+        if (p) { try { p.stdin.end(); } catch { /* */ } setTimeout(() => { try { p.kill(); } catch { /* */ } }, 2000); }
+        this.fail("PowerShell stopped");
+    }
+
+    private fail(why: string) {
+        for (const w of this.wait.values()) w.rej(new Error(why));
+        this.wait.clear();
+    }
+
+    private ensure(): Promise<void> {
+        if (this.p && this.ready) return this.ready;
+        const enc = Buffer.from(PS_LOOP, "utf16le").toString("base64");
+        const p = spawn("powershell.exe", ["-NoProfile", "-NonInteractive", "-STA", "-ExecutionPolicy", "Bypass", "-EncodedCommand", enc], { windowsHide: true });
+        this.p = p;
+        this.buf = "";
+        p.stdout.setEncoding("utf8");
+        p.stderr.on("data", () => { });
+        p.stdin.on("error", () => { });
+        this.ready = new Promise<void>((res, rej) => {
+            const t = setTimeout(() => rej(new Error("PowerShell didn't start in time")), 30_000);
+            this.wait.set("ready", { res: () => { clearTimeout(t); res(); }, rej: e => { clearTimeout(t); rej(e); } });
+        });
+        this.ready.catch(() => { if (this.p === p) this.stop(); });
+        p.stdout.on("data", (d: string) => {
+            this.buf += d;
+            let nl: number;
+            while ((nl = this.buf.indexOf("\n")) >= 0) {
+                const line = this.buf.slice(0, nl).trim();
+                this.buf = this.buf.slice(nl + 1);
+                if (!line.startsWith("{")) continue;
+                let j: any;
+                try { j = JSON.parse(line); } catch { continue; }
+                const key = j.ready ? "ready" : String(j.id ?? "");
+                const w = this.wait.get(key);
+                if (w) { this.wait.delete(key); w.res(j); }
+            }
+        });
+        const gone = () => { if (this.p === p) { this.p = null; this.ready = null; this.fail("PowerShell ended"); } };
+        p.on("exit", gone);
+        p.on("error", gone);
+        return this.ready;
+    }
+
+    /** One clipboard read, answered by the kept PowerShell (one at a time). */
+    read(mode: ContentMode | "files", png: string, timeoutMs = 12_000): Promise<{ files?: unknown; image?: boolean; text?: unknown; error?: string; }> {
+        if (process.platform !== "win32") return Promise.reject(new Error("Windows only"));
+        this.touch();
+        const job = this.chain.then(async () => {
+            await this.ensure();
+            const p = this.p;
+            if (!p) throw new Error("PowerShell ended");
+            const id = randomBytes(6).toString("hex");
+            return new Promise<any>((res, rej) => {
+                const t = setTimeout(() => {
+                    this.wait.delete(id);
+                    rej(new Error("PowerShell didn't answer"));
+                    this.stop(); // stuck: a fresh one next time
+                }, timeoutMs);
+                this.wait.set(id, { res: v => { clearTimeout(t); res(v); }, rej: e => { clearTimeout(t); rej(e); } });
+                p.stdin.write(JSON.stringify({ id, mode, png }) + "\n");
+            });
+        });
+        this.chain = job.catch(() => { });
+        return job.then(j => { if (j?.error) throw new Error(String(j.error)); return j; });
+    }
+}
+const psHost = new PsHost();
 
 /** macOS: JXA (osascript -l JavaScript) reads every copied file, a PNG/TIFF image or text. */
 function macScript(mode: ContentMode, png: string): string {
@@ -255,8 +385,14 @@ async function systemClipboard(mode: ContentMode): Promise<RawClipboard> {
     };
 
     if (process.platform === "win32") {
-        const encoded = Buffer.from(windowsScript(mode, png), "utf16le").toString("base64");
-        const r = parse(await run("powershell.exe", ["-NoProfile", "-NonInteractive", "-STA", "-ExecutionPolicy", "Bypass", "-EncodedCommand", encoded]));
+        let r: RawClipboard & { image: boolean; };
+        try {
+            r = parse(JSON.stringify(await psHost.read(mode, png)));
+        } catch (e) {
+            log("Kept PowerShell failed, starting a one-off one:", e);
+            const encoded = Buffer.from(windowsScript(mode, png), "utf16le").toString("base64");
+            r = parse(await run("powershell.exe", ["-NoProfile", "-NonInteractive", "-STA", "-ExecutionPolicy", "Bypass", "-EncodedCommand", encoded], 20_000));
+        }
         return { files: r.files, text: r.text, png: r.image ? await takeFile(png) : null };
     }
     if (process.platform === "darwin") {
@@ -302,30 +438,50 @@ function shellListKey(c: ElectronClipboard, first: string): string {
     }
 }
 
-/** Copied files through Electron (Windows: PowerShell lists them when there's more than one). */
+/** How many items Explorer copied: the first number of its "Shell IDList Array" (CIDA.cidl). */
+function shellItemCount(c: ElectronClipboard): number {
+    try {
+        const ids = c.readBuffer!("Shell IDList Array");
+        return ids && ids.length >= 4 ? ids.readUInt32LE(0) : 0;
+    } catch {
+        return 0;
+    }
+}
+
+/** Copied files through Electron (Windows: the kept PowerShell lists them when there's more than one). */
 async function electronFiles(c: ElectronClipboard): Promise<string[]> {
     if (process.platform === "win32") {
         // "FileNameW" only holds the FIRST copied file; it tells us cheaply whether files are there.
         if (!isFn(c, "readBuffer")) return (await systemClipboard("media")).files;
         const first = c.readBuffer!("FileNameW").toString("utf16le").replace(/\0[\s\S]*$/, "");
         if (!first) return [];
-        // Starting PowerShell is the slow part (often a second). The same copied files give the
-        // same list, so a peek followed by a send (or two peeks) only start it once.
+        // One copied file (the item count says so): that's all there is, no PowerShell at all.
+        const count = shellItemCount(c);
+        if (count === 1) return [first];
+        // The same copied files give the same list, so a peek followed by a send only asks once.
         const key = shellListKey(c, first);
         const now = Date.now();
         if (key && fileListCache && fileListCache.key === key && now - fileListCache.at < FILE_LIST_TTL_MS) {
             try {
                 return await fileListCache.list;
-            } catch { /* that run failed: start a new one below */ }
+            } catch { /* that run failed: ask again below */ }
         }
-        const list = run("powershell.exe", [
-            "-NoProfile", "-NonInteractive", "-STA", "-ExecutionPolicy", "Bypass", "-Command",
-            "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; Get-Clipboard -Format FileDropList | ForEach-Object { $_.FullName }"
-        ]).then(out => {
-            const all = out.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+        const list = (async () => {
+            let all: string[] = [];
+            try {
+                const r = await psHost.read("files", "");
+                all = (Array.isArray(r.files) ? r.files : r.files ? [r.files] : []).map(String).filter(Boolean);
+            } catch (e) {
+                log("Kept PowerShell couldn't list the files, starting a one-off one:", e);
+                const out = await run("powershell.exe", [
+                    "-NoProfile", "-NonInteractive", "-STA", "-ExecutionPolicy", "Bypass", "-Command",
+                    "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; Get-Clipboard -Format FileDropList | ForEach-Object { $_.FullName }"
+                ], 20_000);
+                all = out.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+            }
             if (!all.length) throw new Error("PowerShell listed no files");
             return all;
-        });
+        })();
         if (key) {
             const entry = { key, at: now, list };
             fileListCache = entry;
@@ -334,7 +490,9 @@ async function electronFiles(c: ElectronClipboard): Promise<string[]> {
         try {
             return await list;
         } catch (e) {
-            log("PowerShell file list failed, using the first file only:", e);
+            // Better no send than one that quietly leaves files out.
+            if (count > 1) throw Object.assign(new Error(`Couldn't list the ${count} copied files. Press again.`), { status: 500 });
+            log("Couldn't list the copied files, using the first file only:", e);
             return [first];
         }
     }
@@ -409,7 +567,13 @@ const stamp = () => {
 
 async function readClipboard(mode: ContentMode, quick = false): Promise<Snapshot> {
     const snap: Snapshot = { id: randomBytes(8).toString("hex"), at: Date.now(), kind: "empty", items: [], text: "", skipped: [] };
-    const raw = await rawClipboard(mode, quick);
+    let raw = await rawClipboard(mode, quick);
+    // The app that just copied (or a clipboard manager) can hold the clipboard for a moment,
+    // and then everything reads as empty: look again twice before saying so.
+    for (let i = 0; i < 2 && !raw.files.length && !raw.png?.length && !raw.imageSize && !raw.text.trim(); i++) {
+        await new Promise(r => setTimeout(r, 150));
+        raw = await rawClipboard(mode, quick);
+    }
 
     if (raw.files.length) {
         if (raw.files.length > MAX_FILES) throw Object.assign(new Error(`Too many files (${raw.files.length}). At most ${MAX_FILES} at once.`), { status: 400 });
@@ -597,6 +761,9 @@ async function handle(req: IncomingMessage, res: ServerResponse) {
         }
     }
 
+    // The Stream Deck checks in every few seconds while a key is on screen: keep the
+    // clipboard reader ready for the next press.
+    if (path === "/status") psHost.warm();
     const route = FORWARD[path];
     if (!route) return send(res, 404, { error: "Not found" });
     if (req.method !== route.method) return send(res, 405, { error: "Method not allowed" });
@@ -636,6 +803,8 @@ export function start(event: IpcMainInvokeEvent, port: number): Promise<{ ok: bo
             server = srv;
             serverPort = p;
             log(`HTTP API on http://127.0.0.1:${p}`);
+            // Get the clipboard reader ready a little after Discord settled (Windows).
+            setTimeout(() => psHost.warm(), 8000);
             resolve({ ok: true, port: p });
         });
     });
@@ -643,6 +812,7 @@ export function start(event: IpcMainInvokeEvent, port: number): Promise<{ ok: bo
 
 export function stop(_: IpcMainInvokeEvent) {
     closeServer();
+    psHost.stop();
     snapshots.clear();
     renderer = null;
 }
